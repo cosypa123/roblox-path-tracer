@@ -93,6 +93,7 @@ Measured on an Intel i5-11400H (laptop CPU), in the Roblox client (not Studio, w
 **Realtime (128x72, ray-traced, 1 sample/frame, 8 workers)**
 - Average 22.6 fps over 60 seconds with the camera moving the whole time.
 - Range 13 to 44 fps depending on how much scene complexity is in view.
+- Stable FPS, no stuttering. Smooth.
 
 Framerate scales with core count and clock speed. These are CPU-bound numbers; a desktop
 CPU with more cores and better cooling will beat them.

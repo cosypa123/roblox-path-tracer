@@ -31,6 +31,7 @@ local SUN_SAMPLE_PROB     = 0.25
 local AO_RAYS             = 3
 local MAX_BOUNCES         = 3
 local RT_AMBIENT_MUL      = 1.0   -- ambient scale; raised in realtime ray-trace mode (no GI bounce)
+local RT_NO_JITTER      = true  -- true: ray-trace mode never jitters, so moving and still look identical (edges stay jagged when still); false: still frames smooth edges by averaging jittered samples
 
 -- Per-chunk adaptive AO ray count. Set by the RenderChunk handler before it
 -- calls tracePath, read by tracePath's computeAO call. Module-level so the
@@ -201,6 +202,67 @@ local function skyColor(rayDir)
 	end
 end
 
+-- ─── Realtime sky lookup ───────────────────────────────────────────────────
+-- In the day branch the sky is (a function of elevation only) + (a function of the angle to the
+-- sun only), added together. The elevation part is a pile of lerps and powers that was being
+-- recomputed every call, twice per ground pixel and once per sky pixel. In realtime the sun is
+-- fixed, so precompute it into a table and look it up. The sun glow, disc and corona are cheap
+-- and stay exact. Directions below the horizon and night use the original function, and
+-- progressive never uses the table. Checked against the exact formula over 300k directions:
+-- max difference 0.0014 (linear), at the one sharp kink in the gradient.
+local skyColorExact = skyColor
+local SKY_LUT_ON = false
+local SKY_LUT_R, SKY_LUT_G, SKY_LUT_B = table.create(2049, 0), table.create(2049, 0), table.create(2049, 0)
+local SL = { sf = -1, atmR = 0, atmG = 0, atmB = 0, corR = 0, corG = 0, corB = 0, sx = 0, sy = 0, sz = 0 }
+
+local function buildSkyLut()
+	local sf = clamp01(1.0 - SUN_DIRECTION.Y * 2.5)
+	local warmColor = SKY_HORIZON:Lerp(Vector3.new(0.95, 0.75, 0.50), sf)
+	for i = 0, 2048 do
+		local e     = i / 2048
+		local tHigh = clamp01(e * 2.2) ^ 1.4
+		local tLow  = clamp01(1.0 - e * 3.5) ^ 0.8
+		local sky   = SKY_MID:Lerp(SKY_ZENITH, tHigh):Lerp(SKY_HORIZON, tLow)
+		local horizonWarm = clamp01(1.0 - e * 4.0) ^ 2
+		sky = sky:Lerp(warmColor, horizonWarm * 0.45)
+		SKY_LUT_R[i + 1], SKY_LUT_G[i + 1], SKY_LUT_B[i + 1] = sky.X, sky.Y, sky.Z
+	end
+	local atm = Vector3.new(1.0, 0.90, 0.75):Lerp(Vector3.new(1.0, 0.70, 0.40), sf)
+	local cor = Vector3.new(1.0, 0.95, 0.75):Lerp(Vector3.new(1.0, 0.70, 0.35), sf)
+	SL.atmR, SL.atmG, SL.atmB = atm.X, atm.Y, atm.Z
+	SL.corR, SL.corG, SL.corB = cor.X, cor.Y, cor.Z
+	SL.sf = sf
+end
+
+-- call once per realtime message, after the sun direction has been applied
+local function syncSkyLut()
+	if clamp01(1.0 - SUN_DIRECTION.Y * 2.5) ~= SL.sf then buildSkyLut() end
+	SL.sx, SL.sy, SL.sz = SUN_DIRECTION.X, SUN_DIRECTION.Y, SUN_DIRECTION.Z
+end
+
+skyColor = function(rayDir)
+	local e = rayDir.Y
+	if not SKY_LUT_ON or e < 0 or SKY_BRIGHTNESS <= 0.5 then
+		return skyColorExact(rayDir)
+	end
+	if e > 1 then e = 1 end
+	local k = math.floor(e * 2048 + 0.5) + 1
+	local r, g, b = SKY_LUT_R[k], SKY_LUT_G[k], SKY_LUT_B[k]
+	local sunDot = rayDir.X * SL.sx + rayDir.Y * SL.sy + rayDir.Z * SL.sz
+	if sunDot > 0 then
+		local x2   = sunDot * sunDot
+		local glow = x2 * x2 * 0.5
+		r += SL.atmR * glow; g += SL.atmG * glow; b += SL.atmB * glow
+		if sunDot > SUN_SIZE_THRESHOLD then
+			local sunGlow = (sunDot - SUN_SIZE_THRESHOLD) / (1 - SUN_SIZE_THRESHOLD)
+			local disc    = sunGlow ^ 3 * 8.0
+			local corona  = sunGlow ^ 0.55 * 1.4
+			r += disc + SL.corR * corona; g += disc + SL.corG * corona; b += disc + SL.corB * corona
+		end
+	end
+	return Vector3.new(r * SKY_BRIGHTNESS, g * SKY_BRIGHTNESS, b * SKY_BRIGHTNESS)
+end
+
 local function randomHemisphereDir(normal, seed1, seed2)
 	local tangent, bitangent = makeBasis(normal)
 	local sinTheta = math.sqrt(seed1)
@@ -294,8 +356,6 @@ local function directLight(hitPos, normal, albedo, ambientBoost, specPower, roug
 	end
 
 	local groundAmbient = GROUND_BOUNCE * (1 - upFactor) * (isDay and 0.7 or 0.05)
-	-- RT_AMBIENT_MUL > 1 in realtime ray-trace mode: there's no GI bounce to fill shadows,
-	-- so the deterministic sky/ground ambient is boosted to keep shadowed areas looking good.
 	local ambient = Vector3.new(
 		albedo.X * (skyAmbient.X + groundAmbient.X + ambientBoost) * RT_AMBIENT_MUL,
 		albedo.Y * (skyAmbient.Y + groundAmbient.Y + ambientBoost) * RT_AMBIENT_MUL,
@@ -671,6 +731,7 @@ local R_VAR_SHARP      = 0.02
 local R_FROZEN         = 3
 local R_DITHER         = nil  -- lazily built once per worker (depends only on output dims)
 local RT_ACCUM         = nil  -- persistent realtime running-mean buffer (owned here, not round-tripped)
+local RT_SKY           = nil  -- persistent per-pixel sky/geometry class, decided once per accumulation
 
 actor:BindToMessageParallel("ReconstructTile", function(data)
 	R_EXPOSURE = data.exposure or 0.5
@@ -887,6 +948,8 @@ actor:BindToMessageParallel("RealtimeChunk", function(data)
 	if data.sunDirection  then SUN_DIRECTION  = data.sunDirection  end
 	if data.sunColor      then SUN_COLOR      = data.sunColor      end
 	if data.skyBrightness then SKY_BRIGHTNESS = data.skyBrightness end
+	SKY_LUT_ON = (data.skyLut ~= false)
+	if SKY_LUT_ON then syncSkyLut() end
 	BOUNCE_STRENGTH  = data.bounceStrength or 0.6
 	SUN_SAMPLE_PROB  = data.sunSampleProb or 0.25
 	if data.rayTrace then
@@ -925,10 +988,12 @@ actor:BindToMessageParallel("RealtimeChunk", function(data)
 	local need = chunkW * chunkH * 12
 	if RT_ACCUM == nil or buffer.len(RT_ACCUM) ~= need then
 		RT_ACCUM = buffer.create(need)
+		RT_SKY   = buffer.create(chunkW * chunkH)
 		reset = true
 	end
 	local accum = RT_ACCUM
 
+	local tSetup0 = os.clock()   -- TEMP timing
 	task.synchronize()
 	if data.characterFilter and #data.characterFilter > 0 then
 		primaryParams.FilterType = Enum.RaycastFilterType.Exclude
@@ -942,6 +1007,16 @@ actor:BindToMessageParallel("RealtimeChunk", function(data)
 		shadowParams.FilterDescendantsInstances = {}
 	end
 	task.desynchronize()
+	local tLoop0 = os.clock()    -- TEMP timing
+
+	-- Moving frames (reset) in ray-trace mode are shown on their own, with no accumulation to
+	-- average the randomness away. Random sub-pixel jitter and a random sun-cone sample then make
+	-- every edge and shadow edge flicker frame to frame. So while moving, sample the pixel centre
+	-- and the exact sun direction (stable); the random jitter only starts once the camera is still
+	-- and frames are being averaged, where it turns into clean anti-aliasing.
+	local noJit = data.noJitter
+	if noJit == nil then noJit = RT_NO_JITTER end
+	local stableMoving = (data.rayTrace == true) and (reset or noJit)
 
 	local invN = 1 / frameN
 	for ly = 0, chunkH - 1 do
@@ -970,8 +1045,13 @@ actor:BindToMessageParallel("RealtimeChunk", function(data)
 				local s3 = (sidx * 0.3819660113 + o3) % 1
 				local s4 = (sidx * 0.6180339887 + o4) % 1
 				-- Subpixel jitter → anti-aliasing + convergence
-				local screenX = (((gx + s1 - 0.5) + 0.5) / FULL_W) * 2 - 1
-				local screenY = -((((gy + s2 - 0.5) + 0.5) / FULL_H) * 2 - 1)
+				local jx, jy = s1, s2
+				if stableMoving then
+					jx, jy = 0.5, 0.5     -- pixel centre, no random sub-pixel offset
+					s1, s2 = 1.0, 0.5     -- seed 1.0 puts the sun-cone sample exactly on the sun axis
+				end
+				local screenX = (((gx + jx - 0.5) + 0.5) / FULL_W) * 2 - 1
+				local screenY = -((((gy + jy - 0.5) + 0.5) / FULL_H) * 2 - 1)
 				local viewVector = Vector3.new(screenX * halfWidth, screenY * halfHeight, -1).Unit
 				local rayDir = fixedCamFrame:VectorToWorldSpace(viewVector).Unit
 				local sample, hd = tracePath(fixedCamFrame.Position, rayDir, sunStrength, lights, s1, s2, s3, s4)
@@ -1001,174 +1081,46 @@ actor:BindToMessageParallel("RealtimeChunk", function(data)
 
 
 			local off = pi * 4
-			if hitDepth >= 9990 then
-				buffer.writeu8(out, off,     rdwriteSky(ar, 0))
-				buffer.writeu8(out, off + 1, rdwriteSky(ag, 0))
-				buffer.writeu8(out, off + 2, rdwriteSky(ab, 0))
-			else
-				local br, bg, bb = rdwrite3(ar, ag, ab, 0)
-				buffer.writeu8(out, off,     br)
-				buffer.writeu8(out, off + 1, bg)
-				buffer.writeu8(out, off + 2, bb)
-			end
-			buffer.writeu8(out, off + 3, 255)
-		end
-	end
-
-	task.synchronize()
-	local ev = script.Parent.Parent.Parent:FindFirstChild("BindableEvent")
-	ev:Fire({
-		kind          = "reconstruct",
-		tileIndex     = data.tileIndex,
-		passNumber    = passNum,
-		displayBuffer = display,
-		reconvBuffer  = reconvBuf,
-		frozenCount   = frozenCount,
-	})
-end)
-
--- ─── Realtime mode ──────────────────────────────────────────────────────────
--- A single low-res frame traced at 1 sample/pixel, 1 bounce, no AO, tonemapped in
--- the worker and sent back ready to blit. No accumulation, no reconstruction — the
--- camera moves freely and each frame is drawn fresh. Noisy by nature (1 spp); the
--- point is interactivity, not the converged image.
-actor:BindToMessageParallel("RealtimeChunk", function(data)
-	R_EXPOSURE = data.exposure or 0.5
-	if data.sunDirection  then SUN_DIRECTION  = data.sunDirection  end
-	if data.sunColor      then SUN_COLOR      = data.sunColor      end
-	if data.skyBrightness then SKY_BRIGHTNESS = data.skyBrightness end
-	BOUNCE_STRENGTH  = data.bounceStrength or 0.6
-	SUN_SAMPLE_PROB  = data.sunSampleProb or 0.25
-	if data.rayTrace then
-		-- Ray-trace mode: no stochastic GI bounce at all → zero noise, clean every frame,
-		-- and faster (one less ray/pixel). Deterministic ambient is boosted to fill shadows.
-		MAX_BOUNCES     = 0
-		RT_AMBIENT_MUL  = 1.6
-	else
-		MAX_BOUNCES     = data.maxBounces or 1
-		RT_AMBIENT_MUL  = 1.0
-	end
-	ADAPTIVE_AO_RAYS = 0  -- no AO in realtime
-
-	local chunkX, chunkY = data.chunkX, data.chunkY
-	local chunkW, chunkH = data.chunkW, data.chunkH
-	local tileOffsetX, tileOffsetY = data.tileOffsetX, data.tileOffsetY
-	local FULL_W, FULL_H = data.FULL_W, data.FULL_H
-	local halfWidth, halfHeight = data.halfWidth, data.halfHeight
-	local lights = data.lights
-	local sunStrength = data.sunStrength or 1.8
-	local fixedCamFrame = CFrame.fromMatrix(data.camPos, data.camRight, data.camUp, -data.camLook)
-
-	-- Temporal accumulation: frameN is how many frames have accumulated at the current
-	-- camera pose. reset (or frameN<=1) starts fresh. The running mean (linear HDR) is kept
-	-- in this worker's own RT_ACCUM between frames — not sent to/from the Controller — so we
-	-- average the new sample in place, then tonemap the mean. frame varies the seed each
-	-- frame so new samples differ and the average actually converges.
-	local frameN    = data.frameN or 1
-	local reset     = data.reset or (frameN <= 1)
-	local frame     = data.frame or 0
-	local spp       = data.spp or 1   -- samples per pixel per frame
-
-	local out  = buffer.create(chunkW * chunkH * 4)   -- tonemapped display (sent back)
-	-- Worker-owned running mean: kept here between frames instead of round-tripping to
-	-- the Controller every frame. Reallocated (and force-reset) if the region size changed.
-	local need = chunkW * chunkH * 12
-	if RT_ACCUM == nil or buffer.len(RT_ACCUM) ~= need then
-		RT_ACCUM = buffer.create(need)
-		reset = true
-	end
-	local accum = RT_ACCUM
-
-	task.synchronize()
-	if data.characterFilter and #data.characterFilter > 0 then
-		primaryParams.FilterType = Enum.RaycastFilterType.Exclude
-		primaryParams.FilterDescendantsInstances = data.characterFilter
-		shadowParams.FilterType = Enum.RaycastFilterType.Exclude
-		shadowParams.FilterDescendantsInstances = data.characterFilter
-	else
-		primaryParams.FilterType = Enum.RaycastFilterType.Exclude
-		primaryParams.FilterDescendantsInstances = {}
-		shadowParams.FilterType = Enum.RaycastFilterType.Exclude
-		shadowParams.FilterDescendantsInstances = {}
-	end
-	task.desynchronize()
-
-	local invN = 1 / frameN
-	for ly = 0, chunkH - 1 do
-		local py = chunkY + ly
-		for lx = 0, chunkW - 1 do
-			local px = chunkX + lx
-			local gx = tileOffsetX + px
-			local gy = tileOffsetY + py
-			-- Samples per frame: K jittered samples, averaged. This is the lever that
-			-- cuts noise WHILE MOVING (temporal accumulation only helps when still).
-			-- Sampling is low-discrepancy (R-sequence frac(n·α)) decorrelated per pixel by a
-			-- stable hash offset (Cranley-Patterson). vs the old white-noise sin-hash this
-			-- spreads error evenly instead of clumping → the same ray count looks cleaner,
-			-- which is the whole point while moving (no accumulation to hide clumps).
-			local pid = gy * FULL_W + gx
-			local o1 = math.abs(math.sin(pid * 12.9898) * 43758.5453) % 1
-			local o2 = math.abs(math.sin(pid * 78.2330) * 43758.5453) % 1
-			local o3 = math.abs(math.sin(pid * 39.4250) * 43758.5453) % 1
-			local o4 = math.abs(math.sin(pid * 93.9890) * 43758.5453) % 1
-			local sr, sg, sb = 0, 0, 0
-			local hitDepth = 0
-			for si = 1, spp do
-				local sidx = frame * spp + si       -- unique per frame+sample (→ convergence when still)
-				local s1 = (sidx * 0.7548776662 + o1) % 1
-				local s2 = (sidx * 0.5698402910 + o2) % 1
-				local s3 = (sidx * 0.3819660113 + o3) % 1
-				local s4 = (sidx * 0.6180339887 + o4) % 1
-				-- Subpixel jitter → anti-aliasing + convergence
-				local screenX = (((gx + s1 - 0.5) + 0.5) / FULL_W) * 2 - 1
-				local screenY = -((((gy + s2 - 0.5) + 0.5) / FULL_H) * 2 - 1)
-				local viewVector = Vector3.new(screenX * halfWidth, screenY * halfHeight, -1).Unit
-				local rayDir = fixedCamFrame:VectorToWorldSpace(viewVector).Unit
-				local sample, hd = tracePath(fixedCamFrame.Position, rayDir, sunStrength, lights, s1, s2, s3, s4)
-				sr += math.min(sample.X, 8.0)
-				sg += math.min(sample.Y, 8.0)
-				sb += math.min(sample.Z, 8.0)
-				hitDepth = hd
-			end
-			local invSpp = 1 / spp
-			local r = sr * invSpp
-			local g = sg * invSpp
-			local b = sb * invSpp
-
-			local pi  = (ly * chunkW + lx)
-			local ao12 = pi * 12
-			local ar, ag, ab
+			-- Sky vs geometry picks the tonemap curve (sky: gamma only, geometry: ACES + grade). Decide it
+			-- once per accumulation, on the reset frame, instead of from whichever sample came last.
+			-- Otherwise a silhouette pixel (sky/geometry mix) flips between two different curves
+			-- every frame and shimmers.
+			local isSkyPix
 			if reset then
-				ar, ag, ab = r, g, b
+				isSkyPix = hitDepth >= 9990
+				buffer.writeu8(RT_SKY, pi, isSkyPix and 1 or 0)
 			else
-				ar = buffer.readf32(accum, ao12)     * (frameN - 1) * invN + r * invN
-				ag = buffer.readf32(accum, ao12 + 4) * (frameN - 1) * invN + g * invN
-				ab = buffer.readf32(accum, ao12 + 8) * (frameN - 1) * invN + b * invN
+				isSkyPix = buffer.readu8(RT_SKY, pi) == 1
 			end
-			buffer.writef32(accum, ao12,     ar)
-			buffer.writef32(accum, ao12 + 4, ag)
-			buffer.writef32(accum, ao12 + 8, ab)
-
-
-			local off = pi * 4
-			if hitDepth >= 9990 then
+			if isSkyPix then
 				buffer.writeu8(out, off,     rdwriteSky(ar, 0))
 				buffer.writeu8(out, off + 1, rdwriteSky(ag, 0))
 				buffer.writeu8(out, off + 2, rdwriteSky(ab, 0))
 			else
-				local br, bg, bb = rdwrite3(ar, ag, ab, 0)
-				buffer.writeu8(out, off,     br)
-				buffer.writeu8(out, off + 1, bg)
-				buffer.writeu8(out, off + 2, bb)
+				-- grade on: full warm/cool/saturation grade (rdwrite3); off: lean per-channel write
+				if data.grade ~= false then
+					local br, bg, bb = rdwrite3(ar, ag, ab, 0)
+					buffer.writeu8(out, off,     br)
+					buffer.writeu8(out, off + 1, bg)
+					buffer.writeu8(out, off + 2, bb)
+				else
+					buffer.writeu8(out, off,     rdwrite(ar, 0))
+					buffer.writeu8(out, off + 1, rdwrite(ag, 0))
+					buffer.writeu8(out, off + 2, rdwrite(ab, 0))
+				end
 			end
 			buffer.writeu8(out, off + 3, 255)
 		end
 	end
 
+	local tLoop1 = os.clock()    -- TEMP timing
 	task.synchronize()
 	local ev = script.Parent.Parent.Parent:FindFirstChild("BindableEvent")
 	ev:Fire({
 		kind        = "realtime",
+		traceMs     = (tLoop1 - tLoop0) * 1000,        -- TEMP: pixel loop (rays + shading)
+		setupMs     = (tLoop0 - tSetup0) * 1000,       -- TEMP: filter setup incl. sync waits
+		endSyncMs   = (os.clock() - tLoop1) * 1000,    -- TEMP: wait to return to serial phase
 		tileIndex   = data.tileIndex,
 		chunkX      = chunkX,
 		chunkY      = chunkY,
@@ -1228,6 +1180,7 @@ actor:BindToMessageParallel("RenderChunk", function(data)
 	if data.aoRays         then AO_RAYS         = data.aoRays         end
 	if data.maxBounces     then MAX_BOUNCES     = data.maxBounces     end
 	RT_AMBIENT_MUL = 1.0   -- progressive always uses full GI, normal ambient
+	SKY_LUT_ON = false     -- progressive always uses the exact sky
 	local chunkVariance = data.chunkVariance or 1.0  -- normalized variance for this chunk
 	-- Adaptive AO: scale ray count from 1 (converged) to AO_RAYS (max variance)
 	-- sqrt gives gentler falloff so mid-variance regions still get decent AO

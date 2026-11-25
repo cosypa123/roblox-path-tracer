@@ -75,7 +75,7 @@ local settings = {
 	sunSampleProb  = 0.25,
 	aoRays         = 3,
 	maxBounces     = 3,
-	rtResIndex     = 1,   -- realtime resolution preset (1=lowest … 6=highest); 1 = 128x72
+	rtResIndex     = 3,   -- realtime resolution preset (1=lowest … 8=highest); 3 = 128x72 (1-2 are TEMP ultra-low)
 	rtSamples      = 1,   -- realtime samples per pixel per frame (noise↓ while moving, fps↓)
 	rtBounces      = 1,   -- realtime GI bounces (1–3); more = GI but noisier/slower
 	rtPixelated    = true,  -- realtime display scaling: false=bilinear, true=pixelated
@@ -364,7 +364,7 @@ local sliderSections = {
 	{
 		name = "— ASR",
 		sliders = {
-			{ key = "rtResIndex", label = "rt.res.step",  min = 1, max = 6,   fmt = "%d", isInt = true },
+			{ key = "rtResIndex", label = "rt.res.step",  min = 1, max = 8,   fmt = "%d", isInt = true },
 			{ key = "rtSamples",  label = "rt.samples",   min = 1, max = 8,   fmt = "%d", isInt = true },
 			{ key = "rtBounces",  label = "rt.bounces",   min = 1, max = 3,   fmt = "%d", isInt = true },
 			{ key = "rtWindowMode", label = "rt.window",  min = 1, max = 3,   fmt = "%d", isInt = true },
@@ -1512,25 +1512,173 @@ end
 -- Stepped resolution presets (16:9; each tile is half of full in both axes, and the
 -- tile height is even so it splits cleanly into two worker halves).
 local RT_PRESETS = {
-	{ w = 128, h = 72  },   -- 1  lowest  (fastest, very blocky)
-	{ w = 192, h = 108 },   -- 2
-	{ w = 256, h = 144 },   -- 3
-	{ w = 320, h = 180 },   -- 4  default
-	{ w = 384, h = 216 },   -- 5
-	{ w = 448, h = 252 },   -- 6  highest (slowest)
+	{ w = 64,  h = 36  },   -- 1  TEMP ultra-low
+	{ w = 96,  h = 54  },   -- 2  TEMP low
+	{ w = 128, h = 72  },   -- 3  (was 1) lowest "normal"
+	{ w = 192, h = 108 },   -- 4
+	{ w = 256, h = 144 },   -- 5
+	{ w = 320, h = 180 },   -- 6
+	{ w = 384, h = 216 },   -- 7
+	{ w = 448, h = 252 },   -- 8  highest (slowest)
 }
 
 local RT_FULL_W, RT_FULL_H = 320, 180
-local RT_TILE_W, RT_TILE_H = 160, 90
+local RT_TILE_W, RT_TILE_H = 80, 180
 local rtTileOffsets = {}
+local rtSplit, rtCost, rtTraceNow = {}, {}, {}   -- per strip: rows given to the top worker, per-row cost estimate, this frame's trace times
+local rtBalance = true                           -- TEMP, M key: false = fixed 50/50 row split in each strip
 local realtimeActive  = false
 local realtimeBusy    = false
+local dispatchRealtimeFrame   -- forward declaration; defined below, called from the frame-complete handler
+local rtTickId, rtLastDispatchTickId = 0, 0   -- RenderStepped tick counter / tick of the last dispatch
+local rtLastMoved = true                      -- was the camera moving at the last dispatch
 local realtimePending = 0
 local rtLights        = nil   -- cached lights (don't rescan workspace every frame)
 local rtImages        = {}
 local rtAppliedIndex  = 0
 local rtLastFrame     = 0     -- os.clock() at last completed frame (for FPS)
 local rtFps           = 0     -- smoothed frames/sec
+-- TEMP timing readout (remove after profiling): smoothed per-frame worst-worker times
+local rtDbgTrace, rtDbgSetup, rtDbgEnd = 0, 0, 0   -- max across workers this frame
+local rtDbgTraceS, rtDbgSetupS, rtDbgEndS, rtDbgFrameS = 0, 0, 0, 0
+local rtDbgFrameMax = 0
+
+-- TEMP one-minute realtime report (B = run, N = toggle immediate dispatch)
+local rtImmediate = true            -- false = original behaviour (dispatch only from RenderStepped)
+local rtNoJitter = true             -- TEMP, J key: true = ray-trace mode never jitters (no anti-aliasing, identical moving/still)
+local rtGrade    = true             -- TEMP, K key: true = realtime uses the full colour grade (warm/cool/saturation)
+local rtSkyLut   = true             -- TEMP, L key: true = realtime sky comes from a lookup table instead of being recomputed
+local RT_STILL_FASTPATH = false     -- true: while the camera is still, restart frames immediately (faster
+-- accumulation, but the frame cadence changes the moment you start moving)
+local REP_SECS, REP_SPIN_DEG = 60, 30
+local REP_PITCH_DEG = 0   -- test camera pitch in degrees (positive looks up)
+local rtRepActive = false
+local rtRepStart, rtRepTick0, rtRepStartCF = 0, 0, nil
+local rtRepSavedCF, rtRepPoseLabel = nil, ""   -- your real camera (restored after) / how the start pose was chosen
+local rtRepFrame, rtRepTrace, rtRepSync, rtRepSetup = {}, {}, {}, {}
+local rtRepTraceMin = {}
+local rtRepWSum, rtRepWCnt = {}, {}
+local rtDbgTraceMin = math.huge
+local rtRepDispatch, rtRepTicksUsed = 0, 0
+local rtLastSameTick = false
+
+local function repStats(arr)
+	local n = #arr
+	if n == 0 then return 0, 0, 0, 0, 0 end
+	local s = table.clone(arr)
+	table.sort(s)
+	local sum = 0
+	for i = 1, n do sum += arr[i] end
+	local function pct(p) return s[math.clamp(math.ceil(p * n), 1, n)] end
+	return sum / n, pct(0.5), pct(0.95), pct(0.99), s[n]
+end
+
+local function rtRepRestoreCamera()
+	camera.CameraType = Enum.CameraType.Custom
+	if rtRepSavedCF then camera.CFrame = rtRepSavedCF end
+end
+
+-- Where you spawned, captured once as a fallback if the map has no SpawnLocation.
+local rtSpawnPos = nil
+local function captureSpawn(char)
+	if rtSpawnPos then return end
+	local root = char:WaitForChild("HumanoidRootPart", 10)
+	if root then rtSpawnPos = root.Position end
+end
+if player.Character then task.spawn(captureSpawn, player.Character) end
+player.CharacterAdded:Connect(function(char) task.spawn(captureSpawn, char) end)
+
+-- Fixed, repeatable start pose for the report: the spawn pad (5 studs above its top),
+-- level or at REP_PITCH_DEG. Falls back to the captured spawn point, then the live camera.
+local function rtRepBasePose()
+	local sp = player.RespawnLocation
+	if not (sp and sp:IsA("SpawnLocation")) then
+		sp = workspace:FindFirstChildWhichIsA("SpawnLocation", true)
+	end
+	local pos, label
+	if sp then
+		pos = sp.Position + Vector3.new(0, sp.Size.Y / 2 + 5, 0)
+		label = string.format("SpawnLocation at (%.0f, %.0f, %.0f)", sp.Position.X, sp.Position.Y, sp.Position.Z)
+	elseif rtSpawnPos then
+		pos = rtSpawnPos + Vector3.new(0, 1.5, 0)
+		label = string.format("captured spawn point (%.0f, %.0f, %.0f)", rtSpawnPos.X, rtSpawnPos.Y, rtSpawnPos.Z)
+	else
+		pos = camera.CFrame.Position
+		label = "current camera (no spawn found)"
+	end
+	return CFrame.new(pos) * CFrame.Angles(math.rad(REP_PITCH_DEG), 0, 0), label
+end
+
+local function rtRepFinish(now)
+	rtRepActive = false
+	rtRepRestoreCamera()
+	local secs = now - rtRepStart
+	local n = #rtRepFrame
+	if n == 0 then print("[REPORT] no frames collected"); return end
+	local fAvg, f50, f95, f99, fMax = repStats(rtRepFrame)
+	local tAvg, _, t95 = repStats(rtRepTrace)
+	local sAvg, _, s95 = repStats(rtRepSync)
+	local uAvg = repStats(rtRepSetup)
+	local other = math.max(0, fAvg - tAvg - sAvg)
+	local ticks = rtTickId - rtRepTick0
+	local dups  = rtRepDispatch - rtRepTicksUsed
+	local lines = {}
+	local function add(s) lines[#lines + 1] = s end
+	add("======== REALTIME REPORT ========")
+	add(string.format("config: %dx%d | %s | %d spp | %d workers | dispatch: %s",
+		RT_FULL_W, RT_FULL_H, settings.rtRayTrace and "ray-traced" or "path-traced",
+		settings.rtSamples, NUM_WORKERS, rtImmediate and "gated-immediate" or "original (RenderStepped only)"))
+	add("environment: " .. (RunService:IsStudio() and "Studio (about 2 to 3 times slower than the client)" or "Roblox client"))
+	add(string.format("test: %.1fs, camera auto-spinning %d deg/s in place", secs, REP_SPIN_DEG))
+	add(string.format("start: %s | pitch %d deg | FOV %.0f | character hidden for the test", rtRepPoseLabel, REP_PITCH_DEG, camera.FieldOfView))
+	add(string.format("frames: %d (%.1f fps average)", n, n / secs))
+	local firstN = math.min(12, n)
+	local firstMs = {}
+	for i = 1, firstN do firstMs[i] = string.format("%.0f", rtRepFrame[i]) end
+	add("first " .. firstN .. " frames after motion starts (ms): " .. table.concat(firstMs, ", "))
+	add(string.format("switches: aa jitter %s | grade %s | sky lookup %s | strip balancing %s", rtNoJitter and "off" or "on", rtGrade and "on" or "off", rtSkyLut and "on" or "off", rtBalance and "on" or "off"))
+	add(string.format("frame ms: avg %.1f | p50 %.1f | p95 %.1f | p99 %.1f | worst %.0f", fAvg, f50, f95, f99, fMax))
+	add(string.format("trace ms (slowest worker): avg %.1f | p95 %.1f", tAvg, t95))
+	local mAvg = repStats(rtRepTraceMin)
+	add(string.format("trace spread: fastest worker avg %.1f ms | slowest worker avg %.1f ms | gap %.1f ms", mAvg, tAvg, tAvg - mAvg))
+	local parts = {}
+	for wi = 1, NUM_WORKERS do
+		local cnt = rtRepWCnt[wi] or 0
+		parts[#parts + 1] = string.format("w%d %.1f", wi, cnt > 0 and (rtRepWSum[wi] / cnt) or 0)
+	end
+	add("per-worker trace avg ms (strip n = w" .. "2n-1 top rows, w2n bottom rows): " .. table.concat(parts, " | "))
+	local sp = {}
+	for ti = 1, NUM_TILES do sp[ti] = tostring(rtSplit[ti] or "-") end
+	add(string.format("strip row split at end (rows given to the top worker, of %d): %s", RT_TILE_H, table.concat(sp, ", ")))
+	add(string.format("end-sync ms (slowest worker): avg %.1f | p95 %.1f | setup avg %.1f", sAvg, s95, uAvg))
+	local d = math.max(fAvg, 0.001)
+	add(string.format("frame split: trace %.0f%% | sync %.0f%% | other (idle, hand-off) %.0f%%",
+		tAvg / d * 100, sAvg / d * 100, other / d * 100))
+	add(string.format("engine ticks: %d (%.1f/s) | frames per tick: %.2f", ticks, ticks / secs, n / math.max(1, ticks)))
+	add(string.format("distinct camera poses rendered: %d (%.1f/s) | frames that repeated a tick: %d (%.0f%%)",
+		rtRepTicksUsed, rtRepTicksUsed / secs, dups, dups / math.max(1, rtRepDispatch) * 100))
+	local floorMs = math.max(1, fAvg - tAvg)
+	add(string.format("if tracing were free the frame would still take about %.0f ms (%.0f fps ceiling)", floorMs, 1000 / floorMs))
+	add("=================================")
+	print(table.concat(lines, "\n"))
+end
+
+local function startRtReport()
+	if not realtimeActive then print("[REPORT] enter realtime (T) first, then press B"); return end
+	if rtRepActive then return end
+	rtRepFrame, rtRepTrace, rtRepSync, rtRepSetup = {}, {}, {}, {}
+	rtRepDispatch, rtRepTicksUsed = 0, 0
+	rtRepTraceMin = {}
+	rtRepWSum, rtRepWCnt = {}, {}
+	rtRepSavedCF = camera.CFrame
+	rtRepStartCF, rtRepPoseLabel = rtRepBasePose()
+	camera.CameraType = Enum.CameraType.Scriptable
+	rtRepStart = os.clock()
+	rtRepTick0 = rtTickId
+	rtRepActive = true
+	print(string.format("[REPORT] started: %ds, camera spins by itself, do not touch the mouse", REP_SECS))
+end
+
 -- Temporal accumulation (reset-on-move): converges a still view, hard-resets when the
 -- camera moves so no stale data smears (unlike an EMA blend).
 local rtFrameN        = 0     -- frames accumulated at the current camera pose
@@ -1564,23 +1712,23 @@ local function applyRealtimeLayout()
 		local lbl = rtImages[i] and rtImages[i].label
 		if lbl then
 			local rto = rtTileOffsets[i]
-			local col = (rto.x > 0) and 1 or 0
-			local row = (rto.y > 0) and 1 or 0
+			local col = math.floor(rto.x / RT_TILE_W + 0.5)   -- strip index 0..3
 			if mode == 3 then
-				-- 1:1 native, centred cluster
+				-- 1:1 native, centred strips
 				lbl.Size     = UDim2.new(0, RT_TILE_W, 0, RT_TILE_H)
-				lbl.Position = UDim2.new(0.5, -RT_FULL_W / 2 + col * RT_TILE_W, 0.5, -RT_FULL_H / 2 + row * RT_TILE_H)
+				lbl.Position = UDim2.new(0.5, -RT_FULL_W / 2 + col * RT_TILE_W, 0.5, -RT_FULL_H / 2)
 			elseif mode == 2 then
-				-- standardized windowed, centred, aspect-preserved
+				-- standardized windowed, centred, aspect-preserved; strip edges land on whole pixels so they tile exactly
 				local winW = RT_WIN_W
 				local winH = winW * RT_FULL_H / RT_FULL_W
-				local tw, th = winW / 2, winH / 2
-				lbl.Size     = UDim2.new(0, tw, 0, th)
-				lbl.Position = UDim2.new(0.5, -winW / 2 + col * tw, 0.5, -winH / 2 + row * th)
+				local x0 = math.floor(winW * col / 4 + 0.5)
+				local x1 = math.floor(winW * (col + 1) / 4 + 0.5)
+				lbl.Size     = UDim2.new(0, x1 - x0, 0, winH)
+				lbl.Position = UDim2.new(0.5, -winW / 2 + x0, 0.5, -winH / 2)
 			else
-				-- fullscreen quadrants
-				lbl.Size     = UDim2.new(0.5, 0, 0.5, 0)
-				lbl.Position = UDim2.new(0.5 * col, 0, 0.5 * row, 0)
+				-- fullscreen strips
+				lbl.Size     = UDim2.new(0.25, 0, 1, 0)
+				lbl.Position = UDim2.new(0.25 * col, 0, 0, 0)
 			end
 		end
 	end
@@ -1594,13 +1742,17 @@ local function applyRealtimeResolution(idx)
 	idx = math.clamp(idx, 1, #RT_PRESETS)
 	local p = RT_PRESETS[idx]
 	RT_FULL_W, RT_FULL_H = p.w, p.h
-	RT_TILE_W, RT_TILE_H = p.w // 2, p.h // 2
+	-- Four full-height vertical strips (was 2x2 quadrants). Every strip sees the same mix of sky and
+	-- ground, so the workers carry similar loads. The quadrant layout put the cheap sky in the top
+	-- two tiles and the expensive ground in the bottom two.
+	RT_TILE_W, RT_TILE_H = p.w // 4, p.h
 	rtTileOffsets = {
-		{ x = 0,         y = 0         },
-		{ x = RT_TILE_W, y = 0         },
-		{ x = 0,         y = RT_TILE_H },
-		{ x = RT_TILE_W, y = RT_TILE_H },
+		{ x = 0,             y = 0 },
+		{ x = RT_TILE_W,     y = 0 },
+		{ x = RT_TILE_W * 2, y = 0 },
+		{ x = RT_TILE_W * 3, y = 0 },
 	}
+	rtSplit, rtCost, rtTraceNow = {}, {}, {}
 	for i = 1, NUM_TILES do
 		local old = rtImages[i]
 		if old then
@@ -1609,7 +1761,7 @@ local function applyRealtimeResolution(idx)
 		end
 		local img = AssetService:CreateEditableImage({ Size = Vector2.new(RT_TILE_W, RT_TILE_H) })
 		local lbl = Instance.new("ImageLabel")
-		lbl.Size                   = UDim2.new(0.5, 0, 0.5, 0)
+		lbl.Size                   = UDim2.new(0.25, 0, 1, 0)
 		lbl.BackgroundTransparency = 1
 		lbl.ImageContent           = Content.fromObject(img)
 		lbl.ResampleMode           = settings.rtPixelated and Enum.ResamplerMode.Pixelated or Enum.ResamplerMode.Default
@@ -1627,7 +1779,37 @@ local function applyRealtimeResolution(idx)
 	end
 end
 
-applyRealtimeResolution(settings.rtResIndex or 1)
+applyRealtimeResolution(settings.rtResIndex or 3)
+
+-- Adaptive row split inside each strip. Each strip is traced by two workers: one takes the top rows,
+-- one the rest. Sky rows are cheaper than ground rows, so a fixed 50/50 split leaves the top worker
+-- waiting. After every moving frame, move the split toward the point where both would take equal
+-- time (assuming roughly even cost per row within each part), smoothed so it cannot oscillate.
+-- It freezes while the camera is still: a worker's accumulated pixels only stay valid if the
+-- split stays put.
+local function rtRebalance()
+	local now = rtTraceNow
+	rtTraceNow = {}
+	if not (rtBalance and rtLastMoved) then return end
+	local H = RT_TILE_H
+	local minRows = math.max(2, H // 5)
+	for ti = 1, NUM_TILES do
+		local tr, s = now[ti], rtSplit[ti]
+		if tr and tr[1] and tr[2] and s and s > 0 and s < H then
+			local cT, cB = tr[1] / s, tr[2] / (H - s)            -- ms per row, top and bottom worker
+			local c = rtCost[ti]
+			if not c then
+				rtCost[ti] = { cT, cB }
+				c = rtCost[ti]
+			else
+				c[1] = c[1] + 0.2 * (cT - c[1])
+				c[2] = c[2] + 0.2 * (cB - c[2])
+			end
+			local target = c[2] * H / (c[1] + c[2])               -- split where both halves cost the same
+			rtSplit[ti] = math.clamp(math.floor(s + 0.3 * (target - s) + 0.5), minRows, H - minRows)
+		end
+	end
+end
 
 for _, tile in ipairs(tiles) do
 	tile.doneEvent.Event:Connect(function(data)
@@ -1637,6 +1819,21 @@ for _, tile in ipairs(tiles) do
 			local rt = rtImages[data.tileIndex]
 			rt.image:WritePixelsBuffer(Vector2.new(data.chunkX, data.chunkY), Vector2.new(data.chunkW, data.chunkH), data.colorBuffer)
 			realtimePending -= 1
+			if data.traceMs then
+				local slot = rtTraceNow[data.tileIndex]
+				if not slot then slot = {}; rtTraceNow[data.tileIndex] = slot end
+				slot[(data.chunkY == 0) and 1 or 2] = data.traceMs
+			end
+			-- TEMP: keep the slowest worker's times (the frame waits on the slowest one)
+			rtDbgTrace = math.max(rtDbgTrace, data.traceMs or 0)
+			rtDbgTraceMin = math.min(rtDbgTraceMin, data.traceMs or math.huge)
+			if rtRepActive and data.workerIndex and data.traceMs then
+				local wi = data.workerIndex
+				rtRepWSum[wi] = (rtRepWSum[wi] or 0) + data.traceMs
+				rtRepWCnt[wi] = (rtRepWCnt[wi] or 0) + 1
+			end
+			rtDbgSetup = math.max(rtDbgSetup, data.setupMs or 0)
+			rtDbgEnd   = math.max(rtDbgEnd,   data.endSyncMs or 0)
 			if realtimePending <= 0 then
 				realtimeBusy = false
 				local now = os.clock()
@@ -1645,10 +1842,51 @@ for _, tile in ipairs(tiles) do
 					if dt > 0 then
 						local inst = 1 / dt
 						rtFps = (rtFps == 0) and inst or (rtFps * 0.85 + inst * 0.15)  -- EMA smoothing
+						rtDbgFrameS = rtDbgFrameS * 0.85 + (dt * 1000) * 0.15
+						if dt * 1000 > rtDbgFrameMax then rtDbgFrameMax = dt * 1000 end
+						if rtRepActive then
+							local k = #rtRepFrame + 1
+							rtRepFrame[k] = dt * 1000
+							rtRepTrace[k] = rtDbgTrace
+							rtRepSync[k]  = rtDbgEnd
+							rtRepSetup[k] = rtDbgSetup
+							rtRepTraceMin[k] = (rtDbgTraceMin == math.huge) and 0 or rtDbgTraceMin
+							if now - rtRepStart >= REP_SECS then rtRepFinish(now) end
+						end
+						rtDbgTraceS = rtDbgTraceS * 0.85 + rtDbgTrace * 0.15
+						rtDbgSetupS = rtDbgSetupS * 0.85 + rtDbgSetup * 0.15
+						rtDbgEndS   = rtDbgEndS   * 0.85 + rtDbgEnd   * 0.15
 					end
 				end
+				rtDbgTrace, rtDbgSetup, rtDbgEnd = 0, 0, 0
+				rtDbgTraceMin = math.huge
 				rtLastFrame = now
-				passLabel.Text = string.format("REALTIME %dx%d  %.0f fps", RT_FULL_W, RT_FULL_H, rtFps)
+				passLabel.Text = string.format("REALTIME %dx%d  %.0f fps  [aa %s | grade %s | sky lut %s]",
+					RT_FULL_W, RT_FULL_H, rtFps, rtNoJitter and "off" or "on", rtGrade and "on" or "off", rtSkyLut and "on" or "off")
+				if rtRepActive then
+					passLabel.Text ..= string.format("  [REPORT %ds]", math.max(0, math.ceil(REP_SECS - (now - rtRepStart))))
+				end
+				-- the last in-flight frame lands after realtime was switched off; don't leave its text up
+				if not realtimeActive then passLabel.Text = "Realtime off" end
+				if rtFrameCounter % 120 == 0 then   -- TEMP: also log so a narrow label can't hide it
+					print(string.format("[TIMING] frame %.1fms (longest %.0f) | trace %.1f | setup %.1f | endsync %.1f (worst worker, ms)",
+						rtDbgFrameS, rtDbgFrameMax, rtDbgTraceS, rtDbgSetupS, rtDbgEndS))
+					rtDbgFrameMax = 0
+				end
+				rtRebalance()
+				-- EXPERIMENT: start the next frame right now instead of waiting for the next
+				-- RenderStepped tick (that wait leaves the workers idle for up to an engine frame).
+				-- Skipped while a resolution change is pending, because the RenderStepped loop
+				-- only applies it when idle (an always-busy pipeline would never apply it).
+				if rtImmediate and realtimeActive and settings.rtResIndex == rtAppliedIndex then
+					-- New tick since the last dispatch: the camera pose is fresh, go now.
+					-- Same tick + camera still: go now, the extra samples accumulate.
+					-- Same tick + camera moving: wait for the next tick. Starting now would
+					-- re-render the identical pose, a duplicate frame that reads as judder.
+					if rtTickId ~= rtLastDispatchTickId or (RT_STILL_FASTPATH and not rtLastMoved) then
+						dispatchRealtimeFrame()
+					end
+				end
 			end
 			return
 		end
@@ -1777,7 +2015,7 @@ end
 -- Each frame, if the previous frame's workers are done, snapshot the live camera and
 -- dispatch a fresh 320x180 frame across all 8 workers (2 per tile, top/bottom halves).
 -- The camera is NOT locked — move it with normal controls and the view updates.
-local function dispatchRealtimeFrame()
+function dispatchRealtimeFrame()
 	local cf          = camera.CFrame
 	local fovRad      = math.rad(camera.FieldOfView)
 	local aspect      = RT_FULL_W / RT_FULL_H
@@ -1785,8 +2023,7 @@ local function dispatchRealtimeFrame()
 	local halfWidth   = aspect * halfHeight
 	-- Realtime is a navigation view, so the player's character is shown (not filtered).
 	local charFilter  = {}
-	local halfH = RT_TILE_H // 2
-
+	if rtRepActive and player.Character then charFilter = { player.Character } end   -- report: hide the character
 	-- Camera-move detection → hard reset of the temporal accumulator.
 	local moved = true
 	if rtLastCamCF then
@@ -1796,6 +2033,13 @@ local function dispatchRealtimeFrame()
 		end
 	end
 	rtLastCamCF = cf
+	rtLastMoved = moved
+	rtLastSameTick = (rtTickId == rtLastDispatchTickId)
+	rtLastDispatchTickId = rtTickId
+	if rtRepActive then
+		rtRepDispatch += 1
+		if not rtLastSameTick then rtRepTicksUsed += 1 end
+	end
 
 	if moved then
 		rtFrameN = 1
@@ -1807,16 +2051,25 @@ local function dispatchRealtimeFrame()
 	realtimePending = 0
 	for ti = 1, NUM_TILES do
 		local rto = rtTileOffsets[ti]
-		for h = 0, 1 do   -- top/bottom half → the tile's two workers
+		-- rows for this strip's top worker; the bottom worker takes the rest, so no row is ever lost
+		local topH = rtSplit[ti]
+		if not topH or not rtBalance then
+			topH = rtBalance and math.floor(RT_TILE_H * 0.6) or (RT_TILE_H // 2)
+			rtSplit[ti] = topH
+		end
+		topH = math.clamp(topH, 1, RT_TILE_H - 1)
+		for h = 0, 1 do   -- top rows / bottom rows → the strip's two workers
 			realtimePending += 1
 			local wi = (ti - 1) * 2 + h + 1
+			-- bottom half takes the remainder so an odd tile height leaves no unrendered row
+			local sliceH = (h == 0) and topH or (RT_TILE_H - topH)
 			workers[wi].actor:SendMessage("RealtimeChunk", {
 				kind            = "realtime",
 				tileIndex       = ti,
 				chunkX          = 0,
-				chunkY          = h * halfH,
+				chunkY          = (h == 0) and 0 or topH,
 				chunkW          = RT_TILE_W,
-				chunkH          = halfH,
+				chunkH          = sliceH,
 				tileOffsetX     = rto.x,
 				tileOffsetY     = rto.y,
 				FULL_W          = RT_FULL_W,
@@ -1837,6 +2090,9 @@ local function dispatchRealtimeFrame()
 				sunSampleProb   = settings.sunSampleProb,
 				maxBounces      = settings.rtBounces,
 				rayTrace        = settings.rtRayTrace,
+				noJitter        = rtNoJitter,
+				grade           = rtGrade,
+				skyLut          = rtSkyLut,
 				characterFilter = charFilter,
 				workerIndex     = wi,
 				-- temporal accumulation
@@ -1851,6 +2107,18 @@ local function dispatchRealtimeFrame()
 end
 
 RunService.RenderStepped:Connect(function(dt)
+	rtTickId += 1
+	if rtRepActive then
+		if not realtimeActive then
+			rtRepActive = false
+			rtRepRestoreCamera()
+			print("[REPORT] aborted (left realtime)")
+		else
+			-- yaw about the WORLD up axis: pitch stays exactly as you aimed it and the horizon stays level
+			local yaw = math.rad(REP_SPIN_DEG * (os.clock() - rtRepStart))
+			camera.CFrame = CFrame.new(rtRepStartCF.Position) * CFrame.Angles(0, yaw, 0) * rtRepStartCF.Rotation
+		end
+	end
 	-- Pick up a resolution-step change from the slider (only when idle, to avoid
 	-- rebuilding images mid-frame).
 	if settings.rtResIndex ~= rtAppliedIndex and not realtimeBusy then
@@ -1898,6 +2166,29 @@ end
 
 UserInputService.InputBegan:Connect(function(input, gameProcessed)
 	if gameProcessed then return end
+
+	if input.KeyCode == Enum.KeyCode.B then startRtReport() end
+	if input.KeyCode == Enum.KeyCode.J then
+		rtNoJitter = not rtNoJitter
+		print("[AB] anti-aliasing jitter in ray-trace mode: " .. (rtNoJitter and "OFF (jagged, identical moving/still)" or "ON (smooth when still)"))
+	end
+	if input.KeyCode == Enum.KeyCode.K then
+		rtGrade = not rtGrade
+		print("[AB] realtime colour grade: " .. (rtGrade and "ON" or "OFF"))
+	end
+	if input.KeyCode == Enum.KeyCode.L then
+		rtSkyLut = not rtSkyLut
+		print("[AB] realtime sky lookup table: " .. (rtSkyLut and "ON" or "OFF (original sky function)"))
+	end
+	if input.KeyCode == Enum.KeyCode.M then
+		rtBalance = not rtBalance
+		rtSplit, rtCost, rtTraceNow = {}, {}, {}
+		print("[AB] strip load balancing: " .. (rtBalance and "ON (adaptive row split)" or "OFF (fixed 50/50)"))
+	end
+	if input.KeyCode == Enum.KeyCode.N then
+		rtImmediate = not rtImmediate
+		print("[REPORT] dispatch mode: " .. (rtImmediate and "gated-immediate" or "original (RenderStepped only)"))
+	end
 
 	if input.KeyCode == Enum.KeyCode.T then
 		toggleRealtime()
